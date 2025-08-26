@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "doc-service"
+version = "0.1.0"
+description = "RESTful API for converting complex documents into plain Markdown for LLM consumption"
+requires-python = ">=3.13,<4.0"
+dependencies = [
+  "mojentic",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "docling",
+]
+
+[project.scripts]
+# Convenience entry point to run the dev server: `doc-service`
+"doc-service" = "doc_service.main:run"
+
+# Optional metadata to get started; update as the project evolves
+# license = { text = "" }
+# authors = [ { name = "", email = "" } ]
+
+[project.urls]
+Homepage = "https://example.com/document-conversion-service"
+Source = "https://example.com/document-conversion-service/source"
+
+[tool.hatch.build.targets.wheel]
+# Use src/ layout and include the package from there
+packages = ["src/doc_service"]
