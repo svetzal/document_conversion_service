@@ -1,8 +1,7 @@
 """
 Document Conversion Service package.
 
-This module provides a FastAPI application exposing REST endpoints. Initial
-hello-world endpoint is available at `/hello`.
+This module provides a FastAPI application exposing REST endpoints.
 """
 
 __all__ = ["__version__"]

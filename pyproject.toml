@@ -14,11 +14,15 @@ dependencies = [
   "uvicorn[standard]>=0.27",
   "python-multipart>=0.0.7",
   "docling",
+  "streamlit>=1.37",
+  "requests>=2.31",
 ]
 
 [project.scripts]
 # Convenience entry point to run the dev server: `doc-service`
-"doc-service" = "doc_service.main:run"
+"doc-service" = "doc_service.webapi:run"
+# Streamlit UI entry point: `doc-service-ui`
+"doc-service-ui" = "doc_service.streamlit_app:main"
 
 # Optional metadata to get started; update as the project evolves
 # license = { text = "" }
