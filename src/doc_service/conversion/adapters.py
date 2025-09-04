@@ -36,25 +36,32 @@ class Argon2Security(SecurityGateway):
         return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
     def hash_token(self, token: str) -> str:
-        from argon2.low_level import Type, hash_secret
+        """Hash the token as unpadded base64url-encoded SHA-256 digest of raw token bytes.
+
+        This replaces the previous Argon2 PHC storage to align with the plan.
+        Backward compatibility is maintained in verify().
+        """
+        import hashlib
         raw = self._b64url_to_bytes(token)
-        salt = secrets.token_bytes(16)
-        phc_bytes = hash_secret(
-            secret=raw,
-            salt=salt,
-            time_cost=3,
-            memory_cost=65536,
-            parallelism=1,
-            hash_len=32,
-            type=Type.ID,
-        )
-        return phc_bytes.decode("utf-8")
+        digest = hashlib.sha256(raw).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
     def verify(self, phc_hash: str, token: str) -> bool:
-        from argon2.low_level import verify_secret
-        raw = self._b64url_to_bytes(token)
+        """Verify a token against either legacy Argon2 PHC or new SHA-256 base64url hash.
+
+        - Legacy: if phc_hash starts with "$argon2", use argon2.low_level.verify_secret.
+        - New: compute sha256 over raw token bytes and compare base64url (no padding).
+        """
         try:
-            return verify_secret(phc_hash.encode("utf-8"), raw)
+            if phc_hash.startswith("$argon2"):
+                from argon2.low_level import verify_secret
+                raw = self._b64url_to_bytes(token)
+                return verify_secret(phc_hash.encode("utf-8"), raw)
+            import hashlib, hmac
+            raw = self._b64url_to_bytes(token)
+            digest = hashlib.sha256(raw).digest()
+            calc = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+            return hmac.compare_digest(calc, phc_hash)
         except Exception:
             return False
 

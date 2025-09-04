@@ -17,6 +17,9 @@ app = FastAPI(
     ),
 )
 
+# Debug/diagnostic mode for auth issues (off by default). Never logs secrets.
+DEBUG_AUTH = os.getenv("DOC_SERVICE_DEBUG_AUTH", "").lower() in {"1", "true", "yes", "on"}
+
 # Global configuration defaults
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "300"))
 ALLOWED_MIME = set(
@@ -81,6 +84,32 @@ def _argon2_hash_token(token: str) -> str:
     return phc_bytes.decode("utf-8")
 
 
+def _auth_debug_headers(*, token: str | None, job: dict[str, object] | None) -> dict[str, str]:
+    """Build safe debug headers for troubleshooting 403/423 without exposing secrets.
+
+    Use X-Auth-* prefix for all fields so the Streamlit client (which filters to X-Auth-*) shows them by default.
+    """
+    try:
+        tok = token or ""
+        tlen = len(tok)
+        tfinger = f"{tok[:4]}..{tok[-4:]}" if tlen >= 8 else ""
+        has_hash = False
+        job_id = ""
+        if job:
+            has_hash = bool(job.get("access_token_hash"))
+            job_id = str(job.get("id", ""))
+        return {
+            "X-Auth-Debug": "1",
+            "X-Auth-Token-Length": str(tlen),
+            "X-Auth-Token-Fingerprint": tfinger,
+            "X-Auth-Job-Has-Token-Hash": "1" if has_hash else "0",
+            "X-Auth-Job-Id": job_id,
+            "X-Auth-Data-Dir": str(DATA_DIR),
+        }
+    except Exception:
+        return {"X-Auth-Debug": "1", "X-Auth-Error": "header_build_failed"}
+
+
 
 
 @app.get("/health")
@@ -110,12 +139,20 @@ def _save_job(job: dict[str, object]) -> None:
 
 
 def _validate_bearer_token(auth_header: str | None) -> str:
-    if not auth_header or not auth_header.startswith("Bearer "):
+    # Robust, case-insensitive parsing of the Authorization header and token normalization.
+    if not auth_header:
         raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "missing bearer token"})
-    token = auth_header.removeprefix("Bearer ").strip()
-    # Strict regex: 43 chars base64url unpadded
+    scheme, _, rest = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not rest:
+        raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "missing bearer token"})
+    raw_token = rest.strip()
+    # Accept optional base64url padding ("=") and strip it; validate URL-safe charset.
     import re
-    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", raw_token):
+        raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "malformed token"})
+    token = raw_token.rstrip("=")
+    # For our capability token (32 bytes), unpadded base64url length should be 43.
+    if len(token) != 43:
         raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "malformed token"})
     return token
 
@@ -130,7 +167,8 @@ def _verify_token(job: dict[str, object], token: str) -> None:
         ok = False
     if not ok:
         # 403 when token is well-formed but invalid per PLAN
-        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "invalid token"})
+        headers = _auth_debug_headers(token=token, job=job) if DEBUG_AUTH else None
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "invalid token"}, headers=headers)
 
 
 
@@ -230,12 +268,18 @@ async def get_job(job_id: str, authorization: str | None = Header(None)) -> JSON
         job = SERVICE.load_job(job_id).data
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": "job not found"})
+    # If token hash not yet persisted, signal not ready to avoid spurious 403s
+    if not job.get("access_token_hash"):
+        headers = _auth_debug_headers(token=token, job=job) if DEBUG_AUTH else None
+        raise HTTPException(status_code=423, detail={"code": "not_ready", "message": "job not ready"}, headers=headers)
     if not SERVICE.verify_token(JobRecord(job), token):
         # 403 per plan
-        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "invalid token"})
+        headers = _auth_debug_headers(token=token, job=job) if DEBUG_AUTH else None
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "invalid token"}, headers=headers)
     # Do not expose token hash in response
     redacted = {k: v for k, v in job.items() if k != "access_token_hash"}
-    return JSONResponse(content=redacted)
+    headers = _auth_debug_headers(token=token, job=job) if DEBUG_AUTH else None
+    return JSONResponse(content=redacted, headers=headers or {})
 
 
 @app.get("/jobs/{job_id}/result", response_class=PlainTextResponse)
@@ -247,14 +291,21 @@ async def get_result(job_id: str, authorization: str | None = Header(None)) -> P
         job_rec = SERVICE.load_job(job_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": "job not found"})
+    # If token hash not yet persisted, signal not ready to avoid spurious 403s
+    if not job_rec.data.get("access_token_hash"):
+        headers = _auth_debug_headers(token=token, job=job_rec.data) if DEBUG_AUTH else None
+        raise HTTPException(status_code=423, detail={"code": "not_ready", "message": "job not ready"}, headers=headers)
     if not SERVICE.verify_token(job_rec, token):
-        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "invalid token"})
+        headers = _auth_debug_headers(token=token, job=job_rec.data) if DEBUG_AUTH else None
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "invalid token"}, headers=headers)
     output_uri = job_rec.data.get("output_uri")
     if not output_uri or not Path(str(output_uri)).exists():
-        raise HTTPException(status_code=404, detail={"code": "not_ready", "message": "result not available"})
+        headers = _auth_debug_headers(token=token, job=job_rec.data) if DEBUG_AUTH else None
+        raise HTTPException(status_code=404, detail={"code": "not_ready", "message": "result not available"}, headers=headers)
     with Path(str(output_uri)).open("r", encoding="utf-8") as f:
         content = f.read()
-    return PlainTextResponse(content=content, media_type="text/markdown")
+    headers = _auth_debug_headers(token=token, job=job_rec.data) if DEBUG_AUTH else None
+    return PlainTextResponse(content=content, media_type="text/markdown", headers=headers or {})
 
 
 def run() -> None:

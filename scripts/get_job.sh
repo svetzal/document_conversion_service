@@ -20,5 +20,5 @@ fi
 
 BASE_URL="${3:-${BASE_URL:-http://localhost:8080}}"
 
-curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
-  "${BASE_URL}/jobs/${JOB_ID}" | jq -r '.'
+curl -fsSLi -H "Authorization: Bearer ${TOKEN}" \
+  "${BASE_URL}/jobs/${JOB_ID}" | awk 'BEGIN{h=1} /^\r?$/{h=0} { if (h) print; else body=body $0 "\n" } END{ print "---"; print body }' | sed -n -e '/^X-Auth-/Ip' -e '$p'
