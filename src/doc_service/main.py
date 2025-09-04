@@ -140,18 +140,125 @@ async def _worker_loop(name: str) -> None:
             async def convert_to_markdown() -> str:
                 # Run blocking docling pipeline in a thread
                 def _run() -> str:
+                    # Import pipeline with compatibility across docling versions
                     from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
                     from docling.datamodel.base_models import InputFormat
                     from docling_core.types.doc import DoclingDocument
-                    pipe = StandardPdfPipeline()
+
+                    # Preferred path (per Docling README): use DocumentConverter when available
+                    try:
+                        from docling.document_converter import DocumentConverter  # type: ignore
+                        converter = DocumentConverter()
+                        result = converter.convert(input_uri)
+                        # Extract document across possible result shapes
+                        doc: DoclingDocument | None = None
+                        if hasattr(result, "document"):
+                            doc = result.document  # type: ignore[attr-defined]
+                        elif hasattr(result, "to_doc") and callable(getattr(result, "to_doc")):
+                            doc = result.to_doc()  # type: ignore[assignment]
+                        elif isinstance(result, DoclingDocument):
+                            doc = result
+                        else:
+                            raise RuntimeError("Unexpected result type from DocumentConverter; cannot extract document")
+                        # Convert to Markdown (method names may vary)
+                        if hasattr(doc, "export_to_markdown"):
+                            return doc.export_to_markdown()
+                        if hasattr(doc, "to_markdown"):
+                            return doc.to_markdown()  # type: ignore[no-any-return]
+                        if hasattr(doc, "as_markdown"):
+                            return doc.as_markdown()  # type: ignore[no-any-return]
+                        raise RuntimeError("Doc object from DocumentConverter lacks a markdown export method")
+                    except Exception:
+                        pass
+
+                    # Try to construct pipeline options in a version-tolerant way.
+                    pipe = None
+                    # Strategy 1: Options class in same module
+                    try:
+                        from docling.pipeline.standard_pdf_pipeline import StandardPdfPipelineOptions  # type: ignore
+                        opts = StandardPdfPipelineOptions()  # default options
+                        pipe = StandardPdfPipeline(pipeline_options=opts)
+                    except Exception:
+                        pass
+
+                    # Strategy 2: get_default_options classmethod on the pipeline
+                    if pipe is None:
+                        try:
+                            get_opts = getattr(StandardPdfPipeline, "get_default_options", None)
+                            if callable(get_opts):
+                                opts = get_opts()
+                                pipe = StandardPdfPipeline(pipeline_options=opts)
+                        except Exception:
+                            pass
+
+                    # Strategy 3: alternate module for options (some versions)
+                    if pipe is None:
+                        try:
+                            from docling.pipeline.standard_pdf_pipeline_options import StandardPdfPipelineOptions as StdPdfOpts  # type: ignore
+                            opts = StdPdfOpts()
+                            pipe = StandardPdfPipeline(pipeline_options=opts)
+                        except Exception:
+                            pass
+
+                    # Strategy 4: fall back to no-arg init (older versions accepted this)
+                    if pipe is None:
+                        try:
+                            pipe = StandardPdfPipeline()
+                        except Exception as e:
+                            # Re-raise with a clearer message; it will be captured into job["error"]
+                            raise RuntimeError("Docling StandardPdfPipeline initialization failed across known API variants. Please ensure a compatible docling version is installed.") from e
                     # Detect input format based on extension; fallback to PDF handling which is most common
                     suffix = Path(input_uri).suffix.lower()
                     fmt = InputFormat.from_suffix(suffix) if hasattr(InputFormat, 'from_suffix') else None
                     # Pipeline currently expects PDF paths; for non-PDF, attempt generic load when supported
                     # Many formats are supported in docling via same pipeline when dependencies are present.
-                    result = pipe.run(input_uri)
-                    doc: DoclingDocument = result.document
-                    return doc.export_to_markdown()
+                    # Execute pipeline across API variants
+                    run_methods = [
+                        "run",               # older versions
+                        "run_pdf",           # hypothetical variant
+                        "process",           # generic name in some libs
+                        "__call__",          # callable pipeline
+                    ]
+                    result = None
+                    last_err = None
+                    for m in run_methods:
+                        fn = getattr(pipe, m, None)
+                        if callable(fn):
+                            try:
+                                result = fn(input_uri)
+                                break
+                            except Exception as e:
+                                last_err = e
+                    if result is None:
+                        # Try a standardized runner on the module if provided
+                        try:
+                            from docling.pipeline.standard_pdf_pipeline import run_pipeline  # type: ignore
+                            result = run_pipeline(pipe, input_uri)
+                        except Exception as e:
+                            if last_err is None:
+                                last_err = e
+                    if result is None:
+                        raise RuntimeError("Docling pipeline does not expose a usable run/process method on this version.") from last_err
+
+                    # Extract document across possible result shapes
+                    doc: DoclingDocument | None = None
+                    if hasattr(result, "document"):
+                        doc = result.document  # type: ignore[attr-defined]
+                    elif hasattr(result, "to_doc") and callable(getattr(result, "to_doc")):
+                        doc = result.to_doc()  # type: ignore[assignment]
+                    elif isinstance(result, DoclingDocument):
+                        doc = result
+                    else:
+                        raise RuntimeError("Unexpected result type from Docling pipeline; cannot extract document")
+
+                    # Convert to Markdown (method names may vary)
+                    if hasattr(doc, "export_to_markdown"):
+                        return doc.export_to_markdown()
+                    if hasattr(doc, "to_markdown"):
+                        return doc.to_markdown()  # type: ignore[no-any-return]
+                    if hasattr(doc, "as_markdown"):
+                        return doc.as_markdown()  # type: ignore[no-any-return]
+                    raise RuntimeError("Doc object does not provide a markdown export method across known variants")
                 return await asyncio.to_thread(_run)
 
             md = await convert_to_markdown()
